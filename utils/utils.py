@@ -15,7 +15,7 @@ from models.all_atom_score_model import TensorProductScoreModel as AAScoreModel
 from models.score_model import TensorProductScoreModel as CGScoreModel
 from utils.diffusion_utils import get_timestep_embedding
 from spyrmsd import rmsd, molecule
-
+import pdb
 
 def get_obrmsd(mol1_path, mol2_path, cache_name=None):
     cache_name = datetime.now().strftime('date%d-%m_time%H-%M-%S.%f') if cache_name is None else cache_name
@@ -83,7 +83,7 @@ def get_optimizer_and_scheduler(args, model, scheduler_mode='min'):
     return optimizer, scheduler
 
 
-def get_model(args, device, t_to_sigma, no_parallel=False, confidence_mode=False):
+def get_model(args, device, t_to_sigma, so2_periodic, no_parallel=False, confidence_mode=False):
     if 'all_atoms' in args and args.all_atoms:
         model_class = AAScoreModel
     else:
@@ -98,8 +98,10 @@ def get_model(args, device, t_to_sigma, no_parallel=False, confidence_mode=False
     if args.esm_embeddings_path is not None: lm_embedding_type = 'esm'
 
     model = model_class(t_to_sigma=t_to_sigma,
+                        so2_periodic=so2_periodic,
                         device=device,
                         no_torsion=args.no_torsion,
+                        no_sidechain=args.no_chi_angle,
                         timestep_emb_func=timestep_emb_func,
                         num_conv_layers=args.num_conv_layers,
                         lig_max_radius=args.max_radius,
@@ -115,6 +117,8 @@ def get_model(args, device, t_to_sigma, no_parallel=False, confidence_mode=False
                         dynamic_max_cross=args.dynamic_max_cross,
                         lm_embedding_type=lm_embedding_type,
                         confidence_mode=confidence_mode,
+                        atom_radius=args.atom_radius,
+                        atom_max_neighbors=args.atom_max_neighbors,
                         num_confidence_outputs=len(
                             args.rmsd_classification_cutoff) + 1 if 'rmsd_classification_cutoff' in args and isinstance(
                             args.rmsd_classification_cutoff, list) else 1)
@@ -122,6 +126,7 @@ def get_model(args, device, t_to_sigma, no_parallel=False, confidence_mode=False
     if device.type == 'cuda' and not no_parallel:
         model = DataParallel(model)
     model.to(device)
+    # pdb.set_trace()
     return model
 
 

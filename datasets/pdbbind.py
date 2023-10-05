@@ -11,7 +11,7 @@ import copy
 import numpy as np
 import torch
 from rdkit.Chem import MolToSmiles, MolFromSmiles, AddHs
-from torch_geometric.data import Dataset, HeteroData
+from torch_geometric.data import Dataset, HeteroData, Batch
 from torch_geometric.loader import DataLoader, DataListLoader
 from torch_geometric.transforms import BaseTransform
 from tqdm import tqdm
@@ -22,24 +22,40 @@ from utils.diffusion_utils import modify_conformer, set_time
 from utils.utils import read_strings_from_txt
 from utils import so3, torus
 
-
+# for sidechain torsional diffusion
+from datasets.process_mols import safe_index
+from utils.rotamer import residue_list, atom_name_vocab, get_chi_mask, bb_atom_name, residue_list_expand
+from utils import rotamer
+import pdb
 class NoiseTransform(BaseTransform):
-    def __init__(self, t_to_sigma, no_torsion, all_atom):
+    def __init__(self, t_to_sigma, 
+                 no_torsion, 
+                 all_atom, 
+                 so2_periodic,
+                 atom_cutoff=5.0,
+                 atom_max_neighbors=None, 
+                 train_chi_id=None):
         self.t_to_sigma = t_to_sigma
         self.no_torsion = no_torsion
         self.all_atom = all_atom
+        self.so2_periodic = so2_periodic
+        self.train_chi_id = train_chi_id
+        self.atom_cutoff = atom_cutoff
+        self.atom_max_neighbors = atom_max_neighbors
+        self.NUM_CHI_ANGLES = 4
 
     def __call__(self, data):
         t = np.random.uniform()
-        t_tr, t_rot, t_tor = t, t, t
-        return self.apply_noise(data, t_tr, t_rot, t_tor)
+        t_tr, t_rot, t_tor, t_chi = t, t, t, t
+        # train_chi_id = np.random.randint(self.NUM_CHI_ANGLES) if self.train_chi_id is None else self.train_chi_id
+        return self.apply_noise(data, t_tr, t_rot, t_tor, t_chi)
 
-    def apply_noise(self, data, t_tr, t_rot, t_tor, tr_update = None, rot_update=None, torsion_updates=None):
+    def apply_noise(self, data, t_tr, t_rot, t_tor, t_chi, tr_update = None, rot_update=None, torsion_updates=None):
         if not torch.is_tensor(data['ligand'].pos):
             data['ligand'].pos = random.choice(data['ligand'].pos)
-
-        tr_sigma, rot_sigma, tor_sigma = self.t_to_sigma(t_tr, t_rot, t_tor)
-        set_time(data, t_tr, t_rot, t_tor, 1, self.all_atom, device=None)
+        
+        tr_sigma, rot_sigma, tor_sigma, _ = self.t_to_sigma(t_tr, t_rot, t_tor, t_chi)
+        set_time(data, t_tr, t_rot, t_tor, t_chi, 1, self.all_atom, device=None)
 
         tr_update = torch.normal(mean=0, std=tr_sigma, size=(1, 3)) if tr_update is None else tr_update
         rot_update = so3.sample_vec(eps=rot_sigma) if rot_update is None else rot_update
@@ -51,7 +67,15 @@ class NoiseTransform(BaseTransform):
         data.rot_score = torch.from_numpy(so3.score_vec(vec=rot_update, eps=rot_sigma)).float().unsqueeze(0)
         data.tor_score = None if self.no_torsion else torch.from_numpy(torus.score(torsion_updates, tor_sigma)).float()
         data.tor_sigma_edge = None if self.no_torsion else np.ones(data['ligand'].edge_mask.sum()) * tor_sigma
+
         return data
+
+def collate_fn(data_list, transform=None): # DataListLoader won't call this function, collate_fn is deleted in the source code
+    if transform is not None:
+        train_chi_id = np.random.randint(4)
+        transform.train_chi_id = train_chi_id
+        data_list = [transform(d) for d in data_list]
+    return Batch.from_data_list(data_list)
 
 
 class PDBBind(Dataset):
@@ -93,8 +117,9 @@ class PDBBind(Dataset):
         self.num_conformers = num_conformers
         self.all_atoms = all_atoms
         self.atom_radius, self.atom_max_neighbors = atom_radius, atom_max_neighbors
-        if not os.path.exists(os.path.join(self.full_cache_path, "heterographs.pkl"))\
-                or (require_ligand and not os.path.exists(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"))):
+        # pdb.set_trace()
+        if not os.path.exists(os.path.join(self.full_cache_path, "heterographs_debug.pkl"))\
+                or (require_ligand and not os.path.exists(os.path.join(self.full_cache_path, "rdkit_ligands_debug.pkl"))):
             os.makedirs(self.full_cache_path, exist_ok=True)
             if protein_path_list is None or ligand_descriptions is None:
                 self.preprocessing()
@@ -112,6 +137,71 @@ class PDBBind(Dataset):
 
     def len(self):
         return len(self.complex_graphs)
+    
+    # functions for sidechain torsional diffusion
+    def chi_torsion_features(self, complex_graphs, rec):
+        # get residue type and atom name lists [Num_atom] * 2
+        # atom_feat = comlex_graphs['atom'].x
+        # atom_residue_type = atom_feat[:, 0]
+        # NOTE: The index system is different from the one in process_mols.py
+        atom_residue_type = [] # 20-indexed number as AlphaFold [Num_atom,]
+        atom_name = [] # 37-indexed fixed number [Num_atom,]
+        atom2residue = [] # [Num_atom,] convert the atom_residue_type to residue index array [Num_atoms,] like [0,0,...,0,1,1,..1,...]
+        res_index = 0
+        last_residue = None
+        residue_type = []
+        for i, atom in enumerate(rec.get_atoms()):  # NOTE: atom index must be the same as the one in process_mols.py
+            if atom.name not in atom_name_vocab:
+                continue
+            res = atom.get_parent()
+            res_type_check = safe_index(residue_list_expand, res.get_resname())
+            if res_type_check > 20:
+                res_type = 0
+            else:
+                res_type = safe_index(residue_list, res.get_resname()) # make sure it's normal amino acid
+            res_id = res.get_id() # A residue id is a tuple of (hetero-flag, sequence identifier, insertion code)
+            # pdb.set_trace()
+            atom_name.append(atom_name_vocab[atom.name])
+            atom_residue_type.append(res_type)
+            if last_residue is None:
+                last_residue = res_id
+                residue_type.append(res_type)
+            atom2residue.append(res_index)
+            if res_id != last_residue:
+                res_index += 1
+                last_residue = res_id
+                residue_type.append(res_type)
+        protein = complex_graphs['sidechain']
+        # save the rec_coords for usage in add_noise
+        # protein.rec_coords = rec_coords # the rec_coords here include H atoms
+        atom_residue_type = torch.tensor(atom_residue_type)
+        atom_name = torch.tensor(atom_name)
+        # pdb.set_trace()
+        protein.atom14index = rotamer.restype_atom14_index_map[atom_residue_type, atom_name] # [num_atom,]
+        protein.atom_name = atom_name
+        # complex_graphs['receptor'].residue_type = atom_residue_type
+        residue_indexes = complex_graphs['receptor'].x[:,0]
+        protein.num_residue = residue_indexes.shape[0]
+        protein.num_nodes = complex_graphs['receptor'].num_nodes
+        # complex_graphs['sidechain'].num_nodes = complex_graphs['receptor'].num_nodes
+        protein.atom2residue = torch.tensor(atom2residue)
+        protein.residue_type = torch.tensor(residue_type)
+        atom_position = complex_graphs['atom'].pos #NOTE: [num_atom, 3] and the atom index must be the same as the one in process_mols.py
+        protein.node_position = atom_position
+        # Init residue masks
+        chi_mask = get_chi_mask(protein, device=atom_position.device) # [num_residue, 4]
+        # pdb.set_trace()
+        chi_1pi_periodic_mask = torch.tensor(rotamer.chi_pi_periodic)[protein.residue_type]
+        chi_2pi_periodic_mask = ~chi_1pi_periodic_mask
+        protein.chi_mask = chi_mask
+        protein.chi_1pi_periodic_mask = torch.logical_and(chi_mask, chi_1pi_periodic_mask)  # [num_residue, 4]
+        protein.chi_2pi_periodic_mask = torch.logical_and(chi_mask, chi_2pi_periodic_mask)  # [num_residue, 4]
+        # Init atom37 features
+        protein.atom37_mask = torch.zeros(protein.num_residue, len(atom_name_vocab), device=chi_mask.device,
+                                            dtype=torch.bool)  # [num_residue, 37]
+        protein.atom37_mask[protein.atom2residue, protein.atom_name] = True
+        protein.sidechain37_mask = protein.atom37_mask.clone()  # [num_residue, 37]
+        protein.sidechain37_mask[:, bb_atom_name] = False
 
     def get(self, idx):
         if self.require_ligand:
@@ -131,17 +221,23 @@ class PDBBind(Dataset):
 
         if self.esm_embeddings_path is not None:
             id_to_embeddings = torch.load(self.esm_embeddings_path)
+            # sort the list of embeddings by the complex name
+            id_to_embeddings = {k: v for k, v in sorted(id_to_embeddings.items(), key=lambda item: item[0])}
             chain_embeddings_dictlist = defaultdict(list)
+            # name_check = []
             for key, embedding in id_to_embeddings.items():
                 key_name = key.split('_')[0]
                 if key_name in complex_names_all:
+                    # name_check.append(key)
+                    # pdb.set_trace()
                     chain_embeddings_dictlist[key_name].append(embedding)
+            # pdb.set_trace()
             lm_embeddings_chains_all = []
             for name in complex_names_all:
                 lm_embeddings_chains_all.append(chain_embeddings_dictlist[name])
         else:
             lm_embeddings_chains_all = [None] * len(complex_names_all)
-
+        # print()
         if self.num_workers > 1:
             # running preprocessing in parallel on multiple workers and saving the progress every 1000 complexes
             for i in range(len(complex_names_all)//1000+1):
@@ -183,6 +279,7 @@ class PDBBind(Dataset):
                 pickle.dump((rdkit_ligands_all), f)
         else:
             complex_graphs, rdkit_ligands = [], []
+            # complex_names_debug = complex_names_all[:1000]
             with tqdm(total=len(complex_names_all), desc='loading complexes') as pbar:
                 for t in map(self.get_complex, zip(complex_names_all, lm_embeddings_chains_all, [None] * len(complex_names_all), [None] * len(complex_names_all))):
                     complex_graphs.extend(t[0])
@@ -326,15 +423,15 @@ class PDBBind(Dataset):
                     continue
 
                 get_rec_graph(rec, rec_coords, c_alpha_coords, n_coords, c_coords, complex_graph, rec_radius=self.receptor_radius,
-                              c_alpha_max_neighbors=self.c_alpha_max_neighbors, all_atoms=self.all_atoms,
-                              atom_radius=self.atom_radius, atom_max_neighbors=self.atom_max_neighbors, remove_hs=self.remove_hs, lm_embeddings=lm_embeddings)
+                                c_alpha_max_neighbors=self.c_alpha_max_neighbors, all_atoms=self.all_atoms,
+                                atom_radius=self.atom_radius, atom_max_neighbors=self.atom_max_neighbors, remove_hs=self.remove_hs, lm_embeddings=lm_embeddings)
 
             except Exception as e:
                 print(f'Skipping {name} because of the error:')
                 print(e)
                 failed_indices.append(i)
-                continue
-
+                continue            
+            self.chi_torsion_features(complex_graph, rec)
             protein_center = torch.mean(complex_graph['receptor'].pos, dim=0, keepdim=True)
             complex_graph['receptor'].pos -= protein_center
             if self.all_atoms:
@@ -378,9 +475,10 @@ def print_statistics(complex_graphs):
         print(f"{name[i]}: mean {np.mean(array)}, std {np.std(array)}, max {np.max(array)}")
 
 
-def construct_loader(args, t_to_sigma):
+def construct_loader(args, t_to_sigma, so2_periodic):
     transform = NoiseTransform(t_to_sigma=t_to_sigma, no_torsion=args.no_torsion,
-                               all_atom=args.all_atoms)
+                               all_atom=args.all_atoms, so2_periodic=so2_periodic, 
+                               atom_cutoff=args.atom_radius, atom_max_neighbors=args.atom_max_neighbors,)
 
     common_args = {'transform': transform, 'root': args.data_dir, 'limit_complexes': args.limit_complexes,
                    'receptor_radius': args.receptor_radius,
@@ -391,6 +489,7 @@ def construct_loader(args, t_to_sigma):
                    'atom_radius': args.atom_radius, 'atom_max_neighbors': args.atom_max_neighbors,
                    'esm_embeddings_path': args.esm_embeddings_path}
 
+    # pdb.set_trace()
     train_dataset = PDBBind(cache_path=args.cache_path, split_path=args.split_train, keep_original=True,
                             num_conformers=args.num_conformers, **common_args)
     val_dataset = PDBBind(cache_path=args.cache_path, split_path=args.split_val, keep_original=True, **common_args)

@@ -190,5 +190,3 @@ for idx, orig_complex_graph in tqdm(enumerate(test_loader)):
 print(f'Failed for {failures} complexes')
 print(f'Skipped {skipped} complexes')
 print(f'Results are in {args.out_dir}')
-
-

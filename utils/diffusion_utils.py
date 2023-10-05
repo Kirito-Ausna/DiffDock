@@ -9,11 +9,12 @@ from utils.geometry import axis_angle_to_matrix, rigid_transform_Kabsch_3D_torch
 from utils.torsion import modify_conformer_torsion_angles
 
 
-def t_to_sigma(t_tr, t_rot, t_tor, args):
+def t_to_sigma(t_tr, t_rot, t_tor, t_chi, args):
     tr_sigma = args.tr_sigma_min ** (1-t_tr) * args.tr_sigma_max ** t_tr
     rot_sigma = args.rot_sigma_min ** (1-t_rot) * args.rot_sigma_max ** t_rot
     tor_sigma = args.tor_sigma_min ** (1-t_tor) * args.tor_sigma_max ** t_tor
-    return tr_sigma, rot_sigma, tor_sigma
+    chi_sigma = args.chi_sigma_min ** (1-t_chi) * args.chi_sigma_max ** t_chi
+    return tr_sigma, rot_sigma, tor_sigma, chi_sigma
 
 
 def modify_conformer(data, tr_update, rot_update, torsion_updates):
@@ -77,20 +78,24 @@ def get_t_schedule(inference_steps):
     return np.linspace(1, 0, inference_steps + 1)[:-1]
 
 
-def set_time(complex_graphs, t_tr, t_rot, t_tor, batchsize, all_atoms, device):
+def set_time(complex_graphs, t_tr, t_rot, t_tor, t_chi, batchsize, all_atoms, device):
     complex_graphs['ligand'].node_t = {
         'tr': t_tr * torch.ones(complex_graphs['ligand'].num_nodes).to(device),
         'rot': t_rot * torch.ones(complex_graphs['ligand'].num_nodes).to(device),
-        'tor': t_tor * torch.ones(complex_graphs['ligand'].num_nodes).to(device)}
+        'tor': t_tor * torch.ones(complex_graphs['ligand'].num_nodes).to(device),
+        'chi': t_chi * torch.ones(complex_graphs['ligand'].num_nodes).to(device)}
     complex_graphs['receptor'].node_t = {
         'tr': t_tr * torch.ones(complex_graphs['receptor'].num_nodes).to(device),
         'rot': t_rot * torch.ones(complex_graphs['receptor'].num_nodes).to(device),
-        'tor': t_tor * torch.ones(complex_graphs['receptor'].num_nodes).to(device)}
+        'tor': t_tor * torch.ones(complex_graphs['receptor'].num_nodes).to(device),
+        'chi': t_chi * torch.ones(complex_graphs['receptor'].num_nodes).to(device)}
     complex_graphs.complex_t = {'tr': t_tr * torch.ones(batchsize).to(device),
                                'rot': t_rot * torch.ones(batchsize).to(device),
-                               'tor': t_tor * torch.ones(batchsize).to(device)}
+                               'tor': t_tor * torch.ones(batchsize).to(device),
+                               'chi': t_chi * torch.ones(batchsize).to(device)}
     if all_atoms:
         complex_graphs['atom'].node_t = {
             'tr': t_tr * torch.ones(complex_graphs['atom'].num_nodes).to(device),
             'rot': t_rot * torch.ones(complex_graphs['atom'].num_nodes).to(device),
-            'tor': t_tor * torch.ones(complex_graphs['atom'].num_nodes).to(device)}
+            'tor': t_tor * torch.ones(complex_graphs['atom'].num_nodes).to(device),
+            'chi': t_chi * torch.ones(complex_graphs['atom'].num_nodes).to(device)}

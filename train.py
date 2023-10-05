@@ -18,7 +18,8 @@ from datasets.pdbbind import construct_loader
 from utils.parsing import parse_train_args
 from utils.training import train_epoch, test_epoch, loss_function, inference_epoch
 from utils.utils import save_yaml_file, get_optimizer_and_scheduler, get_model, ExponentialMovingAverage
-
+from utils.so2 import SO2VESchedule
+import pdb
 
 def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_loader, t_to_sigma, run_dir):
     best_val_loss = math.inf
@@ -26,31 +27,36 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
     best_epoch = 0
     best_val_inference_epoch = 0
     loss_fn = partial(loss_function, tr_weight=args.tr_weight, rot_weight=args.rot_weight,
-                      tor_weight=args.tor_weight, no_torsion=args.no_torsion)
+                      tor_weight=args.tor_weight, chi_weight=args.chi_weight, no_torsion=args.no_torsion, no_chi_angle=args.no_chi_angle)
 
     print("Starting training...")
     for epoch in range(args.n_epochs):
         if epoch % 5 == 0: print("Run name: ", args.run_name)
         logs = {}
-        train_losses = train_epoch(model, train_loader, optimizer, device, t_to_sigma, loss_fn, ema_weights)
-        print("Epoch {}: Training loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}"
+        train_losses = train_epoch(model, train_loader, optimizer, args.device, t_to_sigma, loss_fn, ema_weights)
+        print("Epoch {}: Training loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}    chi {:.4f}"
               .format(epoch, train_losses['loss'], train_losses['tr_loss'], train_losses['rot_loss'],
-                      train_losses['tor_loss']))
+                      train_losses['tor_loss'], train_losses['chi_loss']))
 
         ema_weights.store(model.parameters())
         if args.use_ema: ema_weights.copy_to(model.parameters()) # load ema parameters into model for running validation and inference
-        val_losses = test_epoch(model, val_loader, device, t_to_sigma, loss_fn, args.test_sigma_intervals)
-        print("Epoch {}: Validation loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}"
-              .format(epoch, val_losses['loss'], val_losses['tr_loss'], val_losses['rot_loss'], val_losses['tor_loss']))
+        val_losses = test_epoch(model, val_loader, args.device, t_to_sigma, loss_fn, args.test_sigma_intervals)
+        print("Epoch {}: Validation loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   chi {:.4f}"
+              .format(epoch, val_losses['loss'], val_losses['tr_loss'], val_losses['rot_loss'], val_losses['tor_loss'], val_losses['chi_loss']))
 
         if args.val_inference_freq != None and (epoch + 1) % args.val_inference_freq == 0:
-            inf_metrics = inference_epoch(model, val_loader.dataset.complex_graphs[:args.num_inference_complexes], device, t_to_sigma, args)
+            inf_metrics = inference_epoch(model, val_loader.dataset.complex_graphs[:args.num_inference_complexes], args.device, t_to_sigma, args)
             print("Epoch {}: Val inference rmsds_lt2 {:.3f} rmsds_lt5 {:.3f}"
                   .format(epoch, inf_metrics['rmsds_lt2'], inf_metrics['rmsds_lt5']))
+            print(f"atom_rmsd_per_residue: {inf_metrics['atom_rmsd_per_residue'].mean():<20}"
+                  f"chi_0_mae_deg: {inf_metrics['chi_0_ae_deg'].mean():<20}"
+                  f"chi_1_mae_deg: {inf_metrics['chi_1_ae_deg'].mean():<20}"
+                  f"chi_2_mae_deg: {inf_metrics['chi_2_ae_deg'].mean():<20}"
+                  f"chi_3_mae_deg: {inf_metrics['chi_3_ae_deg'].mean():<20}")
             logs.update({'valinf_' + k: v for k, v in inf_metrics.items()}, step=epoch + 1)
 
         if not args.use_ema: ema_weights.copy_to(model.parameters())
-        ema_state_dict = copy.deepcopy(model.module.state_dict() if device.type == 'cuda' else model.state_dict())
+        ema_state_dict = copy.deepcopy(model.module.state_dict() if args.device.type == 'cuda' else model.state_dict())
         ema_weights.restore(model.parameters())
 
         if args.wandb:
@@ -59,7 +65,7 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             logs['current_lr'] = optimizer.param_groups[0]['lr']
             wandb.log(logs, step=epoch + 1)
 
-        state_dict = model.module.state_dict() if device.type == 'cuda' else model.state_dict()
+        state_dict = model.module.state_dict() if args.device.type == 'cuda' else model.state_dict()
         if args.inference_earlystop_metric in logs.keys() and \
                 (args.inference_earlystop_goal == 'min' and logs[args.inference_earlystop_metric] <= best_val_inference_value or
                  args.inference_earlystop_goal == 'max' and logs[args.inference_earlystop_metric] >= best_val_inference_value):
@@ -90,8 +96,20 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
     print("Best inference metric {} on Epoch {}".format(best_val_inference_value, best_val_inference_epoch))
 
 
-def main_function():
+def main_function(device):
     args = parse_train_args()
+    args.device = device
+    if args.wandb:
+        wandb.init(
+            entity='kirito_asuna',
+            dir=args.log_dir,
+            resume='allow',
+            project=args.project,
+            name=args.run_name,
+            id=args.run_name,
+            config=args
+        )
+        wandb.log({'numel': numel})
     if args.config:
         config_dict = yaml.load(args.config, Loader=yaml.FullLoader)
         arg_dict = args.__dict__
@@ -110,9 +128,18 @@ def main_function():
 
     # construct loader
     t_to_sigma = partial(t_to_sigma_compl, args=args)
-    train_loader, val_loader = construct_loader(args, t_to_sigma)
-
-    model = get_model(args, device, t_to_sigma=t_to_sigma)
+    so2_1pi_periodic = SO2VESchedule(pi_periodic=True, cache_folder=args.diffusion_cache_folder, 
+                                     sigma_min=args.chi_sigma_min, sigma_max=args.chi_sigma_max, 
+                                     annealed_temp=args.chi_annealed_temp, mode=args.chi_mode)
+    so2_2pi_periodic = SO2VESchedule(pi_periodic=False, cache_folder=args.diffusion_cache_folder, 
+                                     sigma_min=args.chi_sigma_min, sigma_max=args.chi_sigma_max, 
+                                     annealed_temp=args.chi_annealed_temp, mode=args.chi_mode)
+    
+    so2_periodic = [so2_1pi_periodic, so2_2pi_periodic]
+    train_loader, val_loader = construct_loader(args, t_to_sigma, 
+                                                so2_periodic)
+    # pdb.set_trace()
+    model = get_model(args, args.device, t_to_sigma=t_to_sigma, so2_periodic=so2_periodic)
     optimizer, scheduler = get_optimizer_and_scheduler(args, model, scheduler_mode=args.inference_earlystop_goal if args.val_inference_freq is not None else 'min')
     ema_weights = ExponentialMovingAverage(model.parameters(),decay=args.ema_rate)
 
@@ -123,7 +150,7 @@ def main_function():
             optimizer.load_state_dict(dict['optimizer'])
             model.module.load_state_dict(dict['model'], strict=True)
             if hasattr(args, 'ema_rate'):
-                ema_weights.load_state_dict(dict['ema_weights'], device=device)
+                ema_weights.load_state_dict(dict['ema_weights'], device=args.device)
             print("Restarting from epoch", dict['epoch'])
         except Exception as e:
             print("Exception", e)
@@ -134,25 +161,21 @@ def main_function():
     numel = sum([p.numel() for p in model.parameters()])
     print('Model with', numel, 'parameters')
 
-    if args.wandb:
-        wandb.init(
-            entity='entity',
-            settings=wandb.Settings(start_method="fork"),
-            project=args.project,
-            name=args.run_name,
-            config=args
-        )
-        wandb.log({'numel': numel})
-
     # record parameters
+    args.device = args.device.type # just record type of device
+    # calculate number of used gpus
+    if args.device == 'cuda':
+        args.num_gpus = torch.cuda.device_count()
+    else:
+        args.num_gpus = 0
     run_dir = os.path.join(args.log_dir, args.run_name)
     yaml_file_name = os.path.join(run_dir, 'model_parameters.yml')
     save_yaml_file(yaml_file_name, args.__dict__)
-    args.device = device
+    args.device = device # restore device
 
     train(args, model, optimizer, scheduler, ema_weights, train_loader, val_loader, t_to_sigma, run_dir)
 
 
 if __name__ == '__main__':
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    main_function()
+    main_function(device)

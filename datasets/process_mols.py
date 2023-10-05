@@ -14,6 +14,7 @@ from rdkit.Geometry import Point3D
 from scipy import spatial
 from scipy.special import softmax
 from torch_cluster import radius_graph
+import pdb
 
 
 import torch.nn.functional as F
@@ -149,7 +150,7 @@ def parse_pdb_from_path(path):
     return rec
 
 
-def extract_receptor_structure(rec, lig, lm_embedding_chains=None):
+def extract_receptor_structure(rec, lig, lm_embedding_chains=None, pocket_cutoff=8):
     conf = lig.GetConformer()
     lig_coords = conf.GetPositions()
     min_distances = []
@@ -159,6 +160,7 @@ def extract_receptor_structure(rec, lig, lm_embedding_chains=None):
     c_coords = []
     valid_chain_ids = []
     lengths = []
+    pockect_res_masks = [] # pockect residue mask for every chain, including non-valid chain for matching orignal codes
     for i, chain in enumerate(rec):
         chain_coords = []  # num_residues, num_atoms, 3
         chain_c_alpha_coords = []
@@ -166,6 +168,7 @@ def extract_receptor_structure(rec, lig, lm_embedding_chains=None):
         chain_c_coords = []
         count = 0
         invalid_res_ids = []
+        pck_res_mask = []
         for res_idx, residue in enumerate(chain):
             if residue.get_resname() == 'HOH':
                 invalid_res_ids.append(residue.get_id())
@@ -180,18 +183,24 @@ def extract_receptor_structure(rec, lig, lm_embedding_chains=None):
                 if atom.name == 'C':
                     c = list(atom.get_vector())
                 residue_coords.append(list(atom.get_vector()))
-
-            if c_alpha != None and n != None and c != None:
+            residue_coords = np.array(residue_coords)
+            dist = spatial.distance.cdist(lig_coords, residue_coords).min()
+            if c_alpha != None and n != None and c != None and dist < pocket_cutoff:
+            # if c_alpha != None and n != None and c != None:
                 # only append residue if it is an amino acid and not some weird molecule that is part of the complex
                 chain_c_alpha_coords.append(c_alpha)
                 chain_n_coords.append(n)
                 chain_c_coords.append(c)
-                chain_coords.append(np.array(residue_coords))
+                chain_coords.append(residue_coords)
+                pck_res_mask.append(1)
                 count += 1
             else:
+                if c_alpha != None and n != None and c != None:
+                    pck_res_mask.append(0)
                 invalid_res_ids.append(residue.get_id())
         for res_id in invalid_res_ids:
             chain.detach_child(res_id)
+        
         if len(chain_coords) > 0:
             all_chain_coords = np.concatenate(chain_coords, axis=0)
             distances = spatial.distance.cdist(lig_coords, all_chain_coords)
@@ -205,6 +214,7 @@ def extract_receptor_structure(rec, lig, lm_embedding_chains=None):
         c_alpha_coords.append(np.array(chain_c_alpha_coords))
         n_coords.append(np.array(chain_n_coords))
         c_coords.append(np.array(chain_c_coords))
+        pockect_res_masks.append(np.array(pck_res_mask))
         if not count == 0: valid_chain_ids.append(chain.get_id())
 
     min_distances = np.array(min_distances)
@@ -224,7 +234,11 @@ def extract_receptor_structure(rec, lig, lm_embedding_chains=None):
             if lm_embedding_chains is not None:
                 if i >= len(lm_embedding_chains):
                     raise ValueError('Encountered valid chain id that was not present in the LM embeddings')
-                valid_lm_embeddings.append(lm_embedding_chains[i])
+                mask = torch.from_numpy(pockect_res_masks[i]).bool()
+                valid_lm_embeddings.append(lm_embedding_chains[i][mask])
+                # valid_lm_embeddings.append(lm_embedding_chains[i])
+                # if len(lm_embedding_chains[i]) != len(pockect_res_masks[i]):
+                    # pdb.set_trace()
             valid_n_coords.append(n_coords[i])
             valid_c_coords.append(c_coords[i])
             valid_lengths.append(lengths[i])
@@ -387,10 +401,14 @@ def rec_atom_featurizer(rec):
             atomic_num = periodic_table.GetAtomicNumber(element)
         except:
             atomic_num = -1
-        atom_feat = [safe_index(allowable_features['possible_amino_acids'], atom.get_parent().get_resname()),
+        
+        atom_residue_type = safe_index(allowable_features['possible_amino_acids'], atom.get_parent().get_resname())
+        atom_name2_index = safe_index(allowable_features['possible_atom_type_2'], (atom_name + '*')[:2])
+        atom_name3_index = safe_index(allowable_features['possible_atom_type_3'], atom_name)
+        atom_feat = [atom_residue_type,
                      safe_index(allowable_features['possible_atomic_num_list'], atomic_num),
-                     safe_index(allowable_features['possible_atom_type_2'], (atom_name + '*')[:2]),
-                     safe_index(allowable_features['possible_atom_type_3'], atom_name)]
+                     atom_name2_index,
+                     atom_name3_index]
         atom_feats.append(atom_feat)
 
     return atom_feats
@@ -462,7 +480,12 @@ def get_fullrec_graph(rec, rec_coords, c_alpha_coords, n_coords, c_coords, compl
     atom_coords = torch.from_numpy(np.concatenate(rec_coords, axis=0)).float()
 
     if remove_hs:
-        not_hs = (atom_feat[:, 1] != 0)
+        # also remove all atoms whose index >= 37 in atom37 format
+        # pdb.set_trace()
+        # not_hs = (atom_feat[:, 1] != 0)
+        not_hs = (atom_feat[:, 3] < 37)
+        # not_hs & misc_atom
+        # not_hs = not_hs & misc_atom
         src_c_alpha_idx = src_c_alpha_idx[not_hs]
         atom_feat = atom_feat[not_hs]
         atom_coords = atom_coords[not_hs]
@@ -472,6 +495,7 @@ def get_fullrec_graph(rec, rec_coords, c_alpha_coords, n_coords, c_coords, compl
 
     complex_graph['atom'].x = atom_feat
     complex_graph['atom'].pos = atom_coords
+    # complex_graph['atom'].src_c_alpha_idx = torch.from_numpy(src_c_alpha_idx)
     complex_graph['atom', 'atom_contact', 'atom'].edge_index = atoms_edge_index
     complex_graph['atom', 'atom_rec_contact', 'receptor'].edge_index = atom_res_edge_index
 

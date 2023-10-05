@@ -43,11 +43,11 @@ def _score(exp, omega, eps, L=2000):  # score of density over SO(3)
     return dSigma / exp
 
 
-if os.path.exists('.so3_omegas_array2.npy'):
-    _omegas_array = np.load('.so3_omegas_array2.npy')
-    _cdf_vals = np.load('.so3_cdf_vals2.npy')
-    _score_norms = np.load('.so3_score_norms2.npy')
-    _exp_score_norms = np.load('.so3_exp_score_norms2.npy')
+if os.path.exists('data/diffusion_cache/.so3_omegas_array2.npy'):
+    _omegas_array = np.load('data/diffusion_cache/.so3_omegas_array2.npy')
+    _cdf_vals = np.load('data/diffusion_cache/.so3_cdf_vals2.npy')
+    _score_norms = np.load('data/diffusion_cache/.so3_score_norms2.npy')
+    _exp_score_norms = np.load('data/diffusion_cache/.so3_exp_score_norms2.npy')
 else:
     print("Precomputing and saving to cache SO(3) distribution table")
     _eps_array = 10 ** np.linspace(np.log10(MIN_EPS), np.log10(MAX_EPS), N_EPS)
@@ -60,10 +60,10 @@ else:
 
     _exp_score_norms = np.sqrt(np.sum(_score_norms**2 * _pdf_vals, axis=1) / np.sum(_pdf_vals, axis=1) / np.pi)
 
-    np.save('.so3_omegas_array2.npy', _omegas_array)
-    np.save('.so3_cdf_vals2.npy', _cdf_vals)
-    np.save('.so3_score_norms2.npy', _score_norms)
-    np.save('.so3_exp_score_norms2.npy', _exp_score_norms)
+    np.save('data/diffusion_cache/.so3_omegas_array2.npy', _omegas_array)
+    np.save('data/diffusion_cache/.so3_cdf_vals2.npy', _cdf_vals)
+    np.save('data/diffusion_cache/.so3_score_norms2.npy', _score_norms)
+    np.save('data/diffusion_cache/.so3_exp_score_norms2.npy', _exp_score_norms)
 
 
 def sample(eps):

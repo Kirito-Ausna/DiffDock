@@ -9,17 +9,20 @@ import numpy as np
 from models.score_model import AtomEncoder, TensorProductConvLayer, GaussianSmearing
 from utils import so3, torus
 from datasets.process_mols import lig_feature_dims, rec_residue_feature_dims, rec_atom_feature_dims
-
-
+import pdb
+from utils import rotamer
+from torch_cluster import radius_graph
 class TensorProductScoreModel(torch.nn.Module):
-    def __init__(self, t_to_sigma, device, timestep_emb_func, in_lig_edge_features=4, sigma_embed_dim=32, sh_lmax=2,
+    def __init__(self, t_to_sigma, so2_periodic, device, timestep_emb_func, in_lig_edge_features=4, sigma_embed_dim=32, sh_lmax=2,
                  ns=16, nv=4, num_conv_layers=2, lig_max_radius=5, rec_max_radius=30, cross_max_distance=250,
-                 center_max_distance=30, distance_embed_dim=32, cross_distance_embed_dim=32, no_torsion=False,
+                 center_max_distance=30, distance_embed_dim=32, cross_distance_embed_dim=32, no_torsion=False, no_sidechain=False,
                  scale_by_sigma=True, use_second_order_repr=False, batch_norm=True,
                  dynamic_max_cross=False, dropout=0.0, lm_embedding_type=False, confidence_mode=False,
-                 confidence_dropout=0, confidence_no_batchnorm=False, num_confidence_outputs=1):
+                 confidence_dropout=0, confidence_no_batchnorm=False, num_confidence_outputs=1, 
+                 train_chi_id = None, atom_radius=5, atom_max_neighbors=1000):
         super(TensorProductScoreModel, self).__init__()
         self.t_to_sigma = t_to_sigma
+        self.so2_periodic = so2_periodic
         self.in_lig_edge_features = in_lig_edge_features
         self.sigma_embed_dim = sigma_embed_dim
         self.lig_max_radius = lig_max_radius
@@ -34,11 +37,14 @@ class TensorProductScoreModel(torch.nn.Module):
         self.scale_by_sigma = scale_by_sigma
         self.device = device
         self.no_torsion = no_torsion
+        self.no_sidechain = no_sidechain
         self.num_conv_layers = num_conv_layers
         self.timestep_emb_func = timestep_emb_func
         self.confidence_mode = confidence_mode
         self.num_conv_layers = num_conv_layers
-
+        self.NUM_CHI_ANGLES = 4
+        self.atom_radius, self.atom_max_neighbors = atom_radius, atom_max_neighbors
+        self.train_chi_id = train_chi_id
         # embedding layers
         self.lig_node_embedding = AtomEncoder(emb_dim=ns, feature_dims=lig_feature_dims, sigma_embed_dim=sigma_embed_dim)
         self.lig_edge_embedding = nn.Sequential(nn.Linear(in_lig_edge_features + sigma_embed_dim + distance_embed_dim, ns),nn.ReLU(),nn.Dropout(dropout),nn.Linear(ns, ns))
@@ -155,15 +161,87 @@ class TensorProductScoreModel(torch.nn.Module):
                     nn.Dropout(dropout),
                     nn.Linear(ns, 1, bias=False)
                 )
+            if not no_sidechain:
+                # mlp for sidechain score, Modulelist for independent chi angles prediction
+               self.chi_final_layers = nn.ModuleList(self.build_chi_mlp(dropout) for _ in range(self.NUM_CHI_ANGLES))
+               
+    def build_chi_mlp(self, dropout):
+        chi_mlp = nn.Sequential(
+            nn.Linear(2 * self.ns if self.num_conv_layers >= 3 else self.ns, self.ns),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.ns, self.ns),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.ns, 4)
+        )
+
+        return chi_mlp
+    def add_chi_noise(self, data, chi_id=None):
+        """Add noise to protein and update protein
+
+        Args:
+            batch (dict): batch
+            chi_sigma (torch.Tensor): [num_graph]
+
+        Returns:
+            batch (dict): dict with the following attributes:
+                Protein:
+                    chi_1pi_periodic_mask (torch.Tensor): [num_residue, 4] bool
+                    chi_2pi_periodic_mask (torch.Tensor): [num_residue, 4] bool
+                    chi_mask (torch.Tensor): [num_residue, 4] bool
+                chi_id (int): chi angle to be trained
+                sigma (torch.Tensor): [num_graph] sigma
+                score (torch.Tensor): [num_residue, 4] score
+        """
+        # pdb.set_trace()
+        batch_index = data['atom'].batch # [num_atoms]
+        protein = data['sidechain']
+        # calculate the offset of each protein
+        offset = 0
+        for i in range(data.num_graphs):
+            protein.atom2residue[batch_index == i] += offset
+            offset += protein.num_residue[i]
+        # causal sidechain mask
+        protein.num_residue = sum(protein.num_residue) # handle batch
+        if chi_id is not None:
+            # pdb.set_trace()
+            data = rotamer.remove_by_chi(data, chi_id) # new protein, change with iteration. data['sidechain'] is the original protein will remian as orign
+        # pdb.set_trace()
+        chis = rotamer.get_chis(protein, protein.node_position) # [num_residue, 4]
+        node_chi_sigma = data['receptor'].node_t['chi']
+        # pdb.set_trace()
+        chis, chi_score_1pi = self.so2_periodic[0].add_noise(chis, node_chi_sigma, protein.chi_1pi_periodic_mask)
+        chis, chi_score_2pi = self.so2_periodic[1].add_noise(chis, node_chi_sigma, protein.chi_2pi_periodic_mask)
+        chi_score = torch.where(protein.chi_1pi_periodic_mask, chi_score_1pi, chi_score_2pi)
+        # change the conformation of proteins
+        protein = rotamer.set_chis(protein, chis)
+
+        data.chi_score = chi_score
+        data.chi_id = chi_id
+        # data.chi_sigma = chi_sigma
+        # Modify the complex graph according to protein dict
+        data['atom'].pos = protein.node_position
+        atom_coords = data['atom'].pos
+        atoms_edge_index = radius_graph(atom_coords, self.atom_radius, max_num_neighbors=self.atom_max_neighbors if self.atom_max_neighbors else 1000)
+        data['atom', 'atom_contact', 'atom'].edge_index = atoms_edge_index
+
+        return data
 
     def forward(self, data):
+        # pdb.set_trace()
         if not self.confidence_mode:
-            tr_sigma, rot_sigma, tor_sigma = self.t_to_sigma(*[data.complex_t[noise_type] for noise_type in ['tr', 'rot', 'tor']])
+            tr_sigma, rot_sigma, tor_sigma, _ = self.t_to_sigma(*[data.complex_t[noise_type] for noise_type in ['tr', 'rot', 'tor', 'chi']])
+            if not self.no_sidechain:
+                train_chi_id = np.random.randint(self.NUM_CHI_ANGLES) if self.train_chi_id is None else self.train_chi_id
+                data = self.add_chi_noise(data, chi_id=train_chi_id)
+            # pdb.set_trace()
         else:
-            tr_sigma, rot_sigma, tor_sigma = [data.complex_t[noise_type] for noise_type in ['tr', 'rot', 'tor']]
+            tr_sigma, rot_sigma, tor_sigma, _ = [data.complex_t[noise_type] for noise_type in ['tr', 'rot', 'tor', 'chi']]
 
         # build ligand graph
         lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh = self.build_lig_conv_graph(data)
+        # init_lig_node_attr = lig_node_attr
         lig_node_attr = self.lig_node_embedding(lig_node_attr)
         lig_edge_attr = self.lig_edge_embedding(lig_edge_attr)
 
@@ -171,8 +249,8 @@ class TensorProductScoreModel(torch.nn.Module):
         rec_node_attr, rec_edge_index, rec_edge_attr, rec_edge_sh = self.build_rec_conv_graph(data)
         rec_node_attr = self.rec_node_embedding(rec_node_attr)
         rec_edge_attr = self.rec_edge_embedding(rec_edge_attr)
-
         # build atom graph
+        # pdb.set_trace()
         atom_node_attr, atom_edge_index, atom_edge_attr, atom_edge_sh = self.build_atom_conv_graph(data)
         atom_node_attr = self.atom_node_embedding(atom_node_attr)
         atom_edge_attr = self.atom_edge_embedding(atom_edge_attr)
@@ -203,7 +281,7 @@ class TensorProductScoreModel(torch.nn.Module):
                 # ATOM UPDATES
                 atom_edge_attr_ = torch.cat([atom_edge_attr, atom_node_attr[atom_edge_index[0], :self.ns], atom_node_attr[atom_edge_index[1], :self.ns]], -1)
                 atom_update = self.conv_layers[9*l+3](atom_node_attr, atom_edge_index, atom_edge_attr_, atom_edge_sh)
-
+                # pdb.set_trace()
                 al_edge_attr_ = torch.cat([la_edge_attr, atom_node_attr[la_edge_index[1], :self.ns], lig_node_attr[la_edge_index[0], :self.ns]], -1)
                 al_update = self.conv_layers[9*l+4](lig_node_attr, torch.flip(la_edge_index, dims=[0]), al_edge_attr_,
                                                     la_edge_sh, out_nodes=atom_node_attr.shape[0])
@@ -224,15 +302,16 @@ class TensorProductScoreModel(torch.nn.Module):
                                                     ar_edge_sh, out_nodes=rec_node_attr.shape[0])
 
             # padding original features and update features with residual updates
+            
             lig_node_attr = F.pad(lig_node_attr, (0, lig_update.shape[-1] - lig_node_attr.shape[-1]))
             lig_node_attr = lig_node_attr + lig_update + la_update + lr_update
-
             if l != self.num_conv_layers - 1:  # last layer optimisation
                 atom_node_attr = F.pad(atom_node_attr, (0, atom_update.shape[-1] - rec_node_attr.shape[-1]))
                 atom_node_attr = atom_node_attr + atom_update + al_update + ar_update
+                # pdb.set_trace()
                 rec_node_attr = F.pad(rec_node_attr, (0, rec_update.shape[-1] - rec_node_attr.shape[-1]))
                 rec_node_attr = rec_node_attr + rec_update + ra_update + rl_update
-
+        # pdb.set_trace()
         # confidence and affinity prediction
         if self.confidence_mode:
             scalar_lig_attr = torch.cat([lig_node_attr[:,:self.ns],lig_node_attr[:,-self.ns:]], dim=1) if self.num_conv_layers >= 3 else lig_node_attr[:,:self.ns]
@@ -248,7 +327,8 @@ class TensorProductScoreModel(torch.nn.Module):
         tr_pred = global_pred[:, :3] + global_pred[:, 6:9]
         rot_pred = global_pred[:, 3:6] + global_pred[:, 9:]
         data.graph_sigma_emb = self.timestep_emb_func(data.complex_t['tr'])
-
+        # if tr_pred.mean() > 100:
+        #     pdb.set_trace()
         # adjust the magniture of the score vectors
         tr_norm = torch.linalg.vector_norm(tr_pred, dim=1).unsqueeze(1)
         tr_pred = tr_pred / tr_norm * self.tr_final_layer(torch.cat([tr_norm, data.graph_sigma_emb], dim=1))
@@ -280,7 +360,35 @@ class TensorProductScoreModel(torch.nn.Module):
         if self.scale_by_sigma:
             tor_pred = tor_pred * torch.sqrt(torch.tensor(torus.score_norm(edge_sigma.cpu().numpy())).float()
                                              .to(data['ligand'].x.device))
-        return tr_pred, rot_pred, tor_pred
+        
+        # pdb.set_trace()
+        # calculate sidechain score
+        if self.no_sidechain:
+            return tr_pred, rot_pred, tor_pred, torch.empty(0,device=self.device)
+        chi_id = data.chi_id
+        ar_node_update = scatter_mean(atom_node_attr, data['sidechain'].atom2residue, dim=0, dim_size=data['sidechain'].num_residue)
+        chi_node_attr = rec_node_attr + ar_node_update
+        scalar_chi_attr = torch.cat([chi_node_attr[:,:self.ns],chi_node_attr[:,-self.ns:]], dim=1) if self.num_conv_layers >= 3 else chi_node_attr[:,:self.ns]
+        # pdb.set_trace()
+        chi_pred = self.chi_final_layers[chi_id](scalar_chi_attr)
+
+        chi_sigma = data['receptor'].node_t['chi'] # [num_residue]
+        # scale by norm
+        chi_sigma = chi_sigma.unsqueeze(-1).expand(-1, self.NUM_CHI_ANGLES) # [Num_residues, 4]
+        score_norm_1pi = torch.tensor(self.so2_periodic[0].score_norm(chi_sigma), device=chi_sigma.device)
+        score_norm_2pi = torch.tensor(self.so2_periodic[1].score_norm(chi_sigma), device=chi_sigma.device)
+        # pdb.set_trace()
+        # print("=====================Shape=====================")
+        # print(data["sidechain"].chi_1pi_periodic_mask.shape, score_norm_1pi.shape, score_norm_2pi.shape)
+        # print("=====================device=====================")
+        # print(data["sidechain"].chi_1pi_periodic_mask.device, score_norm_1pi.device, score_norm_2pi.device)
+        score_norm = torch.where(data["sidechain"].chi_1pi_periodic_mask, score_norm_1pi, score_norm_2pi)
+        chi_pred = chi_pred * torch.sqrt(score_norm)
+
+        # Mask out non-related chis
+        chi_pred = chi_pred * data['sidechain'].chi_mask.to(chi_pred.dtype)
+        data.chi_score = data.chi_score * data['sidechain'].chi_mask.to(data.chi_score.dtype)
+        return tr_pred, rot_pred, tor_pred, (chi_pred, score_norm, data.chi_score)
 
     def build_lig_conv_graph(self, data):
         # build the graph between ligand atoms
@@ -329,6 +437,7 @@ class TensorProductScoreModel(torch.nn.Module):
         node_attr = torch.cat([data['atom'].x, data['atom'].node_sigma_emb], 1)
 
         # this assumes the edges were already created in preprocessing since protein's structure is fixed
+        # We add noise to sidechain, so actually we rebuild graph in NoiseTransform function.
         edge_index = data['atom', 'atom'].edge_index
         src, dst = edge_index
         edge_vec = data['atom'].pos[dst.long()] - data['atom'].pos[src.long()]
@@ -363,6 +472,7 @@ class TensorProductScoreModel(torch.nn.Module):
             if torch.is_tensor(lr_cross_distance_cutoff) else lr_cross_distance_cutoff
 
         # LIGAND to ATOM
+        # pdb.set_trace()
         la_edge_index = radius(data['atom'].pos, data['ligand'].pos, self.lig_max_radius,
                                data['atom'].batch, data['ligand'].batch, max_num_neighbors=10000)
 
